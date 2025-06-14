@@ -1,0 +1,96 @@
+﻿name: Enterprise CD Pipeline
+
+on:
+  workflow_run:
+    workflows: ["Enterprise CI Pipeline"]
+    branches: [main]
+    types:
+      - completed
+
+jobs:
+  deploy-staging:
+    name: Deploy to Staging
+    runs-on: ubuntu-latest
+    environment: staging
+    needs: [security-scan]
+    
+    steps:
+    - name: Checkout with CI changes
+      uses: actions/checkout@v4
+      with:
+        ref: main
+
+    - name: Configure AWS Credentials
+      uses: aws-actions/configure-aws-credentials@v4
+      with:
+        aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+        aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+        aws-region: ${{ secrets.AWS_REGION }}
+        role-to-assume: ${{ secrets.AWS_DEPLOY_ROLE_ARN }}
+        role-session-name: GitHubActionsDeploy
+
+    - name: Login to Amazon ECR
+      uses: aws-actions/amazon-ecr-login@v2
+
+    - name: Deploy to Staging Cluster
+      run: |
+        kubectl config use-context staging-cluster
+        kubectl apply -f k8s/staging/ --namespace staging
+        kubectl rollout status deployment/enterprise-demo-app -n staging --timeout=300s
+
+    - name: Run Smoke Tests
+      run: |
+        STAGING_ENDPOINT=$(kubectl get svc enterprise-demo-app -n staging -o jsonpath='{.status.loadBalancer.ingress[0].hostname}')
+        curl -s "http://$STAGING_ENDPOINT/health" | jq -e '.status == "healthy"'
+
+  approve-production:
+    name: Wait for Production Approval
+    needs: deploy-staging
+    runs-on: ubuntu-latest
+    
+    steps:
+    - name: Manual Approval
+      uses: trstringer/manual-approval@v2
+      with:
+        secret: ${{ secrets.PRODUCTION_APPROVAL_TOKEN }}
+        approvers: "devops-team,security-team"
+        minimum-approvals: 2
+        issue-title: "Production Deployment Approval Request"
+        approval-instructions: "Verify staging deployment at https://staging.example.com before approving"
+
+  deploy-production:
+    name: Deploy to Production
+    needs: approve-production
+    runs-on: ubuntu-latest
+    environment: production
+    
+    steps:
+    - name: Checkout with CI changes
+      uses: actions/checkout@v4
+
+    - name: Configure AWS Credentials (Production)
+      uses: aws-actions/configure-aws-credentials@v4
+      with:
+        aws-access-key-id: ${{ secrets.PROD_AWS_ACCESS_KEY_ID }}
+        aws-secret-access-key: ${{ secrets.PROD_AWS_SECRET_ACCESS_KEY }}
+        aws-region: ${{ secrets.PROD_AWS_REGION }}
+        role-to-assume: ${{ secrets.PROD_DEPLOY_ROLE_ARN }}
+
+    - name: Deploy to Production Cluster
+      run: |
+        kubectl config use-context production-cluster
+        kubectl apply -f k8s/production/ --namespace production
+        kubectl rollout status deployment/enterprise-demo-app -n production --timeout=300s
+        
+        # Verify canary deployment
+        kubectl set env deployment/enterprise-demo-app -n production CANARY_WEIGHT=10%
+        sleep 60  # Monitor metrics
+        kubectl set env deployment/enterprise-demo-app -n production CANARY_WEIGHT=100%
+
+    - name: Notify Deployment
+      uses: actions/slack@v2
+      with:
+        status: ${{ job.status }}
+        slack-message: "Production deployment complete"
+      env:
+        SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
