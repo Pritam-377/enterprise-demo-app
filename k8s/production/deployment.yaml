@@ -17,4 +17,4 @@ spec:
       - name: app
         image: your-registry/enterprise-demo-app:1.0.0
         ports:
-        - containerPort: 3000
+        - containerPort: 4000
